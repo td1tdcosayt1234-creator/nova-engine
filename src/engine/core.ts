@@ -179,3 +179,110 @@ export function deserializeScene(text: string): Scene {
   }
   return s
 }
+
+/* ---------- pure-transform behaviors (no physics needed) ---------- */
+
+const fin0 = (x: any): number => (Number.isFinite(Number(x)) ? Number(x) : 0)
+
+function pathTotal(pts: Array<any>): number {
+  let total = 0
+  for (let i = 1; i < pts.length; i++) {
+    total += Math.hypot(fin0(pts[i].x) - fin0(pts[i - 1].x), fin0(pts[i].y) - fin0(pts[i - 1].y))
+  }
+  return total
+}
+
+function samplePath(pts: Array<any>, t: number): { x: number; y: number } {
+  for (let i = 1; i < pts.length; i++) {
+    const ax = fin0(pts[i - 1].x), ay = fin0(pts[i - 1].y)
+    const bx = fin0(pts[i].x), by = fin0(pts[i].y)
+    const seg = Math.hypot(bx - ax, by - ay)
+    if (t <= seg || i === pts.length - 1) {
+      const k = seg > 1e-9 ? clamp(t / seg, 0, 1) : 0
+      return { x: ax + (bx - ax) * k, y: ay + (by - ay) * k }
+    }
+    t -= seg
+  }
+  const last = pts[pts.length - 1]
+  return { x: fin0(last?.x), y: fin0(last?.y) }
+}
+
+/**
+ * Move every `path2d` entity along its waypoints. Standalone — no physics body
+ * required (dynamic blocks teleport; static/kinematic bodies follow along).
+ * 2D scenes travel in (x, y); 3D scenes travel in (x, z).
+ */
+export function tickPath2d(scene: Scene, dt: number) {
+  if (!dt || dt <= 0) return
+  const mode3d = scene.meta.mode === '3d'
+  for (const e of scene.entities) {
+    const p = getComp(e, 'path2d') as any
+    if (!p || !Array.isArray(p.points) || p.points.length < 2) continue
+    const speed = fin0(p.speed)
+    if (speed <= 0) continue
+    const mode = p.loop === true ? 'loop' : (p.loop === 'pingpong' || p.loop === 'once' ? p.loop : 'loop')
+    const total = pathTotal(p.points)
+    if (total <= 1e-9) continue
+    let t = fin0(p.t)
+    let dir = fin0(p.dir) || 1
+    t += dir * speed * dt
+    if (mode === 'pingpong') {
+      while (t > total) { t = total - (t - total); dir = -1 }
+      while (t < 0) { t = -t; dir = 1 }
+    } else if (mode === 'loop') {
+      t = ((t % total) + total) % total
+    } else {
+      t = clamp(t, 0, total)
+    }
+    p.t = Number.isFinite(t) ? t : 0
+    p.dir = dir
+    const pos = samplePath(p.points, t)
+    if (mode3d) {
+      e.transform.pos.x = pos.x
+      e.transform.pos.z = pos.y
+      if (p.face) {
+        const nxt = samplePath(p.points, Math.min(total, t + 0.5))
+        e.transform.rot.y = Math.atan2(pos.y - nxt.y, nxt.x - pos.x) * 180 / Math.PI
+      }
+    } else {
+      e.transform.pos.x = pos.x
+      e.transform.pos.y = pos.y
+      if (p.face) {
+        const nxt = samplePath(p.points, Math.min(total, t + 0.5))
+        e.transform.rot.z = Math.atan2(nxt.y - pos.y, nxt.x - pos.x) * 180 / Math.PI
+      }
+    }
+  }
+}
+
+/* ---------- health component semantics ---------- */
+
+const healthInvuln = new WeakMap<Entity, number>()
+
+/**
+ * `health` component hit semantics: subtracts `amount` hp unless the entity is
+ * inside its invuln window. At hp ≤ 0 the entity is flagged `__dead` (the game
+ * loop purge picks it up). Returns true when damage actually landed.
+ */
+export function hit(e: Entity, amount = 1): boolean {
+  const h = getComp(e, 'health') as any
+  if (!h) return false
+  if ((healthInvuln.get(e) || 0) > 0) return false
+  const invuln = Math.max(0, fin0(h.invuln))
+  const dmg = fin0(amount)
+  h.hp = fin0(h.hp, 1) - dmg
+  healthInvuln.set(e, invuln)
+  if (h.hp <= 0) { h.hp = 0; ;(e as any).__dead = true }
+  return true
+}
+
+/** per-frame gameplay systems: health invuln timers + path2d movement */
+export function tickSystems(scene: Scene, dt: number) {
+  if (dt > 0) {
+    for (const e of scene.entities) {
+      const it = healthInvuln.get(e)
+      if (it != null && it > 0) healthInvuln.set(e, it - dt)
+    }
+  }
+  tickPath2d(scene, dt)
+}

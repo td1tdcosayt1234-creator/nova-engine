@@ -1,25 +1,30 @@
-/* ============ Nova Engine — UI construction (menus, panels, modals) ============ */
+/* ============ Nova Engine — UI construction (menus, panels, modals, toasts) ============ */
 
 import { PROVIDER_INFO, loadAISettings, saveAISettings, testConnection, type AISettings, type ProviderKind } from './ai/providers'
 
 export interface MenuItem { label?: string; hint?: string; sep?: boolean; action?: () => void }
 
+export type EditorTab = 'builder' | 'assistant' | 'console'
+
 export interface UIRefs {
   topbar: HTMLElement
+  menuHost: HTMLElement
   homeBtn: HTMLButtonElement
   saveBtn: HTMLButtonElement
   titleEl: HTMLElement
+  mainEl: HTMLElement
   vpWrap: HTMLElement
   vp2d: HTMLCanvasElement
   vp3d: HTMLElement
   hintEl: HTMLElement
   hierarchyList: HTMLElement
   hierarchyAdd: HTMLButtonElement
+  hierBadge: HTMLElement
   assetGrid: HTMLElement
   assetShuffle: HTMLButtonElement
   inspector: HTMLElement
-  tabBtns: Record<'builder' | 'assistant' | 'console', HTMLButtonElement>
-  tabBodies: Record<'builder' | 'assistant' | 'console', HTMLElement>
+  tabBtns: Record<EditorTab, HTMLButtonElement>
+  tabBodies: Record<EditorTab, HTMLElement>
   builder: { prompt: HTMLTextAreaElement; gen: HTMLButtonElement; blog: HTMLElement; chips: HTMLElement }
   assistant: { logEl: HTMLElement; input: HTMLInputElement; send: HTMLButtonElement }
   console: { logEl: HTMLElement; clear: HTMLButtonElement }
@@ -29,8 +34,15 @@ export interface UIRefs {
   stopBtn: HTMLButtonElement
   seg2d: HTMLButtonElement
   seg3d: HTMLButtonElement
+  /* viewport overlay canvas for gizmos (drawn by editor/gizmo.ts) */
+  gizmoLayer: HTMLCanvasElement
+  /* align/distribute toolbar (top-left of viewport, wired by gizmo.ts) */
+  alignBar: HTMLElement
+  /* fps sparkline canvas */
+  spark: HTMLCanvasElement
 }
 
+let refs: UIRefs | null = null
 function el(tag: string, cls?: string, parent?: HTMLElement): HTMLElement {
   const d = document.createElement(tag)
   if (cls) d.className = cls
@@ -38,8 +50,14 @@ function el(tag: string, cls?: string, parent?: HTMLElement): HTMLElement {
   return d
 }
 
+/** access UI refs after buildUI (used by lazy panel wiring, NOT by main.ts) */
+export function uiRef(): UIRefs | null { return refs }
+
 export function buildUI(app: HTMLElement): UIRefs {
   app.innerHTML = ''
+
+  /* ---------- toast root (bottom-right notifications) ---------- */
+  const toastRoot = el('div', 'toast-root', app)
 
   /* topbar */
   const topbar = el('div', 'topbar', app)
@@ -53,6 +71,7 @@ export function buildUI(app: HTMLElement): UIRefs {
   titleEl.textContent = '—'
 
   const menuHost = el('div', '', topbar)
+  menuHost.id = 'nova-menus'
   menuHost.style.display = 'flex'
   menuHost.style.gap = '2px'
 
@@ -70,6 +89,12 @@ export function buildUI(app: HTMLElement): UIRefs {
   const stopBtn = el('button', 'pbtn stop', playgroup) as HTMLButtonElement
   stopBtn.innerHTML = '⏹ Stop'
 
+  /* fps sparkline (self-updating, no main.ts involvement) */
+  const spark = el('canvas', 'spark', topbar) as HTMLCanvasElement
+  spark.width = 96; spark.height = 22
+  spark.title = 'FPS history (live)'
+  startSpark(spark)
+
   el('div', 'spacer', topbar)
 
   const seg = el('div', 'seg', topbar)
@@ -80,26 +105,40 @@ export function buildUI(app: HTMLElement): UIRefs {
 
   /* main grid */
   const main = el('div', 'main', app)
+  main.id = 'nova-main'
 
   // left column
   const left = el('div', 'panel left', main)
+  const leftStrip = el('div', 'side-strip left', left)
+  const leftSideFold = el('button', 'foldbtn sidefold', leftStrip) as HTMLButtonElement
+  leftSideFold.textContent = '⟨'
+  leftSideFold.title = 'Collapse left column'
   const leftcol = el('div', 'leftcol', left)
 
-  const hierPanel = el('div', 'panel', leftcol)
+  const hierPanel = el('div', 'panel subpanel', leftcol)
   const hierHead = el('div', 'panel-header', hierPanel)
   hierHead.innerHTML = '🌐 Hierarchy'
+  const hierBadge = el('span', 'panel-badge', hierHead)
+  hierBadge.textContent = '0'
   const hierarchyAdd = el('button', 'btn small icon hbtn', hierHead) as HTMLButtonElement
   hierarchyAdd.textContent = '＋'
-  hierarchyAdd.title = 'Add empty entity'
+  hierarchyAdd.title = 'Add entity (presets)'
+  const hierFold = el('button', 'btn small icon hbtn foldbtn', hierHead) as HTMLButtonElement
+  hierFold.textContent = '▾'
+  hierFold.title = 'Collapse this panel'
   const hierarchyList = el('div', 'hlist', hierPanel)
 
-  const assetPanel = el('div', 'panel', leftcol)
+  const assetPanel = el('div', 'panel subpanel', leftcol)
   const assetHead = el('div', 'panel-header', assetPanel)
   assetHead.innerHTML = '🎨 Pixel Art (AI)'
   const assetShuffle = el('button', 'btn small icon hbtn', assetHead) as HTMLButtonElement
   assetShuffle.textContent = '🎲'
   assetShuffle.title = 'Randomize seed of selected entity + gallery'
   const assetGrid = el('div', 'assetgrid', assetPanel)
+  const assetFold = el('button', 'btn small icon hbtn foldbtn', assetHead) as HTMLButtonElement
+  assetFold.textContent = '▾'
+  assetFold.title = 'Collapse this panel'
+  wireFold(assetFold, assetPanel, main, leftcol, 'sub')
 
   // center column
   const center = el('div', 'center', main)
@@ -110,16 +149,52 @@ export function buildUI(app: HTMLElement): UIRefs {
   vp3d.id = 'viewport3d'
   const vp2d = el('canvas', '', vpStack) as HTMLCanvasElement
   vp2d.id = 'viewport2d'
+  const gizmoLayer = el('canvas', 'gizmo-layer', vpStack) as HTMLCanvasElement
+  gizmoLayer.id = 'nova-gizmo-layer'
   const hintEl = el('div', 'vp-hint', vpWrap)
   const vpOverlay = el('div', 'vp-overlay', vpWrap)
   vpOverlay.textContent = 'Nova Engine'
 
-  // bottom tabs
+  // align / snap toolbar (2D editor overlay — wired by gizmo.ts)
+  const alignBar = el('div', 'alignbar', vpWrap)
+  alignBar.dataset.wired = ''
+  const abBtn = (label: string, title: string, mode: string) => {
+    const b = el('button', 'abtn', alignBar) as HTMLButtonElement
+    b.textContent = label
+    b.title = title
+    b.dataset.mode = mode
+    return b
+  }
+  abBtn('⇤', 'Align left', 'left')
+  abBtn('⇥', 'Align right', 'right')
+  abBtn('⤒', 'Align top', 'top')
+  abBtn('⤓', 'Align bottom', 'bottom')
+  abBtn('⇨', 'Center horizontally', 'center-h')
+  abBtn('⇪', 'Center vertically', 'center-v')
+  abBtn('⇹', 'Distribute horizontally (3+ entities)', 'dist-x')
+  abBtn('⇵', 'Distribute vertically (3+ entities)', 'dist-y')
+  const snapWrap = el('span', 'snapwrap', alignBar)
+  const snapBtn = el('button', 'abtn snaptoggle', snapWrap) as HTMLButtonElement
+  snapBtn.textContent = '⌗ Snap'
+  snapBtn.dataset.mode = 'snap-toggle'
+  snapBtn.title = 'Snap to grid (also hold Ctrl while dragging)'
+  for (const s of [8, 16, 32] as const) {
+    const sb = el('button', 'abtn snapsz', snapWrap) as HTMLButtonElement
+    sb.textContent = String(s)
+    sb.title = `Snap size ${s}px`
+    sb.dataset.mode = `snap-size-${s}`
+  }
+
+  /* wire hierarchy fold AFTER hierarchyList exists */
+  wireFold(hierFold, hierPanel, main, leftcol, 'sub')
+  wireFold(leftSideFold, left, main, leftcol, 'left')
+
+  /* bottom tabs */
   const bottom = el('div', 'bottompanel', center)
   const btabs = el('div', 'btabs', bottom)
   const tabBtns: any = {}
   const tabBodies: any = {}
-  const mkTab = (id: 'builder' | 'assistant' | 'console', label: string, badge?: string) => {
+  const mkTab = (id: EditorTab, label: string, badge?: string) => {
     const b = el('button', 'tabbtn', btabs) as HTMLButtonElement
     b.innerHTML = label + (badge ? `<span class="btab-badge">${badge}</span>` : '')
     tabBtns[id] = b
@@ -131,6 +206,10 @@ export function buildUI(app: HTMLElement): UIRefs {
   mkTab('builder', '⌁ AI Builder')
   mkTab('assistant', '💬 AI Assistant')
   mkTab('console', '🖥️ Console')
+
+  /* console filter strip (console.ts shows it) */
+  const consoleHead = el('div', 'consfilter', tabBodies.console)
+  consoleHead.dataset.wired = ''
 
   // builder body
   const builder = el('div', 'builder', tabBodies.builder)
@@ -153,18 +232,24 @@ export function buildUI(app: HTMLElement): UIRefs {
 
   // console body
   const conslog = el('div', 'conslog', tabBodies.console)
-  const consoleHead = el('div', '', tabBodies.console)
-  consoleHead.style.display = 'none'
+  void conslog
   const consFoot = el('div', 'chatinput', tabBodies.console)
   const cclear = el('button', 'btn small', consFoot) as HTMLButtonElement
   cclear.textContent = 'Clear console'
-  void consoleHead
 
-  // right column (inspector)
+  /* ---------- resizable columns ---------- */
   const right = el('div', 'panel right', main)
   const insHead = el('div', 'panel-header', right)
-  insHead.innerHTML = '🔎 Inspector'
+  const rightSideFold = el('button', 'foldbtn sidefold', insHead) as HTMLButtonElement
+  rightSideFold.textContent = '⟩'
+  rightSideFold.title = 'Collapse right column'
+  insHead.append('🔎 Inspector')
+  wireFold(rightSideFold, right, main, null, 'right')
   const inspector = el('div', 'inspector', right)
+
+  const divL = el('div', 'col-divider', main)
+  const divR = el('div', 'col-divider', main)
+  setupResizers(main, divL, divR, leftcol)
 
   /* statusbar */
   const statusbar = el('div', 'statusbar', app)
@@ -179,25 +264,202 @@ export function buildUI(app: HTMLElement): UIRefs {
 
   activateTab('builder')
 
-  return {
-    topbar, homeBtn, saveBtn, titleEl, vpWrap, vp2d, vp3d, hintEl,
-    hierarchyList, hierarchyAdd, assetGrid, assetShuffle,
+  const built: UIRefs = {
+    topbar, menuHost, homeBtn, saveBtn, titleEl, mainEl: main,
+    vpWrap, vp2d, vp3d, hintEl,
+    hierarchyList, hierarchyAdd, hierBadge, assetGrid, assetShuffle,
     inspector,
     tabBtns, tabBodies,
     builder: { prompt, gen, blog, chips },
     assistant: { logEl: chatlog, input: ainput, send: asend },
     console: { logEl: conslog, clear: cclear },
     status: { state: stState, fps: stFps, count: stCount, ai: stAi, sel: stSel, saved: stSaved },
-    playBtn, pauseBtn, stopBtn, seg2d, seg3d
+    playBtn, pauseBtn, stopBtn, seg2d, seg3d,
+    gizmoLayer, alignBar, spark
   }
+  refs = built
+  return built
 }
 
-export function activateTab(id: 'builder' | 'assistant' | 'console') {
+/* ---------- FPS sparkline (independent rAF, ~2 samples/s) ---------- */
+
+function startSpark(canvas: HTMLCanvasElement) {
+  if (typeof requestAnimationFrame !== 'function') return
+  const ctx = canvas.getContext('2d')!
+  const N = 32
+  const samples: number[] = []
+  let last = performance.now()
+  let acc = 0
+  let frames = 0
+  const loop = (t: number) => {
+    requestAnimationFrame(loop)
+    const dt = t - last
+    last = t
+    frames++
+    acc += dt
+    if (acc >= 500) {
+      samples.push(frames / (acc / 1000))
+      if (samples.length > N) samples.shift()
+      frames = 0
+      acc = 0
+      draw()
+      // keep statusbar fps in sync when main loop is idle on home
+      void 0
+    }
+  }
+  function draw() {
+    const w = canvas.width, h = canvas.height
+    ctx.clearRect(0, 0, w, h)
+    ctx.fillStyle = 'rgba(124,92,255,.10)'
+    ctx.fillRect(0, 0, w, h)
+    const max = Math.max(70, ...samples)
+    for (let i = 0; i < samples.length; i++) {
+      const v = Math.min(1, samples[i] / max)
+      const bw = w / N
+      const bh = Math.max(2, v * (h - 6))
+      ctx.fillStyle = samples[i] > 55 ? '#34d399' : samples[i] > 30 ? '#fbbf24' : '#f87171'
+      ctx.fillRect((w - 2) - (samples.length - 1 - i) * bw, h - 2 - bh, Math.max(2, bw - 2), bh)
+    }
+    const cur = samples[samples.length - 1] || 0
+    ctx.fillStyle = '#8a94a6'
+    ctx.font = '9px "Segoe UI", system-ui, sans-serif'
+    ctx.textAlign = 'left'
+    ctx.textBaseline = 'top'
+    ctx.fillText(String(Math.round(cur)), 3, 2)
+  }
+  requestAnimationFrame(loop)
+}
+
+/* ---------- collapsible panels + resizable columns ---------- */
+
+let leftW = 252, rightW = 318, leftFolded = false, rightFolded = false
+
+function loadWidths() {
+  try {
+    const raw = JSON.parse(localStorage.getItem('nova.cols') || 'null')
+    if (raw && typeof raw === 'object') {
+      const L = clamp100(Number(raw.left), 168, 520)
+      const R = clamp100(Number(raw.right), 200, 520)
+      if (L) leftW = L
+      if (R) rightW = R
+      leftFolded = !!raw.leftFolded
+      rightFolded = !!raw.rightFolded
+    }
+  } catch { /* corrupt state — keep defaults */ }
+}
+function saveColumnWidths() {
+  try { localStorage.setItem('nova.cols', JSON.stringify({ left: leftW, right: rightW, leftFolded, rightFolded })) } catch { /* quota */ }
+}
+function clamp100(n: number, lo: number, hi: number): number {
+  if (!Number.isFinite(n)) return 0
+  return Math.max(lo, Math.min(hi, n))
+}
+
+function applyColumnWidths(main: HTMLElement) {
+  main.style.gridTemplateColumns =
+    `${leftFolded ? 26 : leftW}px 6px 1fr 6px ${rightFolded ? 26 : rightW}px`
+}
+
+function updateLeftRows(leftcol: HTMLElement) {
+  const panels = ([...leftcol.children] as HTMLElement[])
+    .filter(c => c.classList?.contains('subpanel'))
+  if (!panels.length) return
+  const rows = panels.map(p => (p.classList.contains('collapsed') ? 'auto' : 'minmax(0, 1fr)'))
+  leftcol.style.gridTemplateRows = rows.join(' ')
+}
+
+/** fold/unfold a side column or a sub panel */
+function wireFold(
+  btn: HTMLButtonElement,
+  panel: HTMLElement,
+  main: HTMLElement,
+  leftcol: HTMLElement | null,
+  side: 'left' | 'right' | 'sub'
+) {
+  btn.addEventListener('click', ev => {
+    ev.stopPropagation()
+    panel.classList.toggle('collapsed')
+    const collapsed = panel.classList.contains('collapsed')
+    btn.textContent = collapsed ? '▸' : '▾'
+    if (side === 'left') { leftFolded = collapsed; applyColumnWidths(main) }
+    else if (side === 'right') { rightFolded = collapsed; applyColumnWidths(main) }
+    else if (leftcol) updateLeftRows(leftcol)
+    saveColumnWidths()
+  })
+}
+
+function setupResizers(main: HTMLElement, divL: HTMLElement, divR: HTMLElement, leftcol: HTMLElement) {
+  loadWidths()
+  applyColumnWidths(main)
+
+  /* restore persisted fold states */
+  const left = main.querySelector<HTMLElement>('.panel.left')
+  const right = main.querySelector<HTMLElement>('.panel.right')
+  if (left && leftFolded && !left.classList.contains('collapsed')) {
+    left.classList.add('collapsed')
+    left.querySelector<HTMLButtonElement>('.sidefold')?.replaceChildren('⟩')
+  }
+  if (right && rightFolded && !right.classList.contains('collapsed')) {
+    right.classList.add('collapsed')
+    right.querySelector<HTMLButtonElement>('.sidefold')?.replaceChildren('⟨')
+  }
+
+  const wireDrag = (d: HTMLElement, side: 'left' | 'right') => {
+    d.addEventListener('mousedown', (ev: MouseEvent) => {
+      if (ev.button !== 0) return
+      ev.preventDefault()
+      const move = (e2: MouseEvent) => {
+        const w = side === 'left'
+          ? clamp100(e2.clientX, 168, 520)
+          : clamp100(window.innerWidth - e2.clientX, 200, 520)
+        if (w) {
+          if (side === 'left') { leftW = w; leftFolded = false } else { rightW = w; rightFolded = false }
+          panelOf(main, side)?.classList.remove('collapsed')
+          foldBtnOf(main, side)?.replaceChildren('▾')
+          applyColumnWidths(main)
+        }
+      }
+      const up = () => {
+        window.removeEventListener('mousemove', move)
+        window.removeEventListener('mouseup', up)
+        saveColumnWidths()
+      }
+      window.addEventListener('mousemove', move)
+      window.addEventListener('mouseup', up)
+    })
+  }
+  wireDrag(divL, 'left')
+  wireDrag(divR, 'right')
+  updateLeftRows(leftcol)
+}
+
+function panelOf(main: HTMLElement, side: 'left' | 'right') {
+  return main.querySelector<HTMLElement>(side === 'left' ? '.panel.left' : '.panel.right')
+}
+function foldBtnOf(main: HTMLElement, side: 'left' | 'right') {
+  return panelOf(main, side)?.querySelector<HTMLButtonElement>('.foldbtn')
+}
+
+/* ---------- toast notifications ---------- */
+
+export function toast(level: 'ok' | 'warn' | 'err' | 'info', msg: string, afterMs = 3000) {
+  const container = document.querySelector('.toast-root') as HTMLElement | null
+  if (!container) return
+  const t = el('div', 'toast ' + level, container)
+  t.textContent = msg
+  while (container.children.length > 5) container.removeChild(container.firstChild!)
+  setTimeout(() => {
+    t.classList.add('out')
+    setTimeout(() => t.remove(), 300)
+  }, afterMs)
+}
+
+export function activateTab(id: EditorTab) {
   document.querySelectorAll('.tabbtn').forEach(b => b.classList.remove('active'))
   document.querySelectorAll('.tabbody').forEach(b => b.classList.remove('active'))
   const btns = document.querySelectorAll('.tabbtn')
   const bodies = document.querySelectorAll('.tabbody')
-  const order = ['builder', 'assistant', 'console']
+  const order: EditorTab[] = ['builder', 'assistant', 'console']
   const idx = order.indexOf(id)
   if (btns[idx]) btns[idx].classList.add('active')
   if (bodies[idx]) bodies[idx].classList.add('active')
@@ -221,18 +483,38 @@ export function showDropdown(anchor: HTMLElement, items: MenuItem[]) {
   const r = anchor.getBoundingClientRect()
   dd.style.left = r.left + 'px'
   dd.style.top = r.bottom + 4 + 'px'
+  fillDropdown(dd, items, anchor)
+  anchor.classList.add('open')
+  openDrop = dd
+}
+
+/** right-click context menu at arbitrary screen position */
+export function showContextMenu(x: number, y: number, items: MenuItem[]) {
+  if (openDrop) { openDrop.remove(); openDrop = null }
+  document.querySelectorAll('.menubtn.open').forEach(b => b.classList.remove('open'))
+  const dd = el('div', 'dropdown ctx', document.body)
+  dd.style.left = '0px'
+  dd.style.top = '0px'
+  fillDropdown(dd, items, null)
+  openDrop = dd
+  // measure, then clamp into viewport
+  const w = dd.offsetWidth, h = dd.offsetHeight
+  dd.style.left = Math.max(4, Math.min(window.innerWidth - w - 8, x)) + 'px'
+  dd.style.top = Math.max(4, Math.min(window.innerHeight - h - 8, y)) + 'px'
+  dd.addEventListener('mousedown', ev => ev.stopPropagation())
+}
+
+function fillDropdown(dd: HTMLElement, items: MenuItem[], anchor: HTMLElement | null) {
   for (const it of items) {
     if (it.sep) { el('div', 'dsep', dd); continue }
     const d = el('div', 'ditem', dd)
-    d.innerHTML = `<span>${it.label}</span>${it.hint ? `<span class="key">${it.hint}</span>` : ''}`
+    d.innerHTML = `<span>${it.label ?? ''}</span>${it.hint ? `<span class="key">${it.hint}</span>` : ''}`
     d.addEventListener('click', () => {
       dd.remove(); openDrop = null
-      anchor.classList.remove('open')
+      anchor?.classList.remove('open')
       it.action?.()
     })
   }
-  anchor.classList.add('open')
-  openDrop = dd
 }
 
 export function menubarButton(topbar: HTMLElement, label: string, items: MenuItem[]): HTMLElement {
@@ -248,6 +530,8 @@ export function menubarButton(topbar: HTMLElement, label: string, items: MenuIte
 
 /* ---------- modals ---------- */
 
+let escWired = false
+
 export function modal(title: string, sub?: string): { body: HTMLElement; close: () => void } {
   closeAllModals()
   const back = el('div', 'modal-back', document.body)
@@ -261,6 +545,17 @@ export function modal(title: string, sub?: string): { body: HTMLElement; close: 
   const close = () => back.remove()
   closeBtn.addEventListener('click', close)
   back.addEventListener('mousedown', ev => { if (ev.target === back) close() })
+  if (!escWired) {
+    escWired = true
+    window.addEventListener('keydown', ev => {
+      if (ev.key === 'Escape') {
+        if (document.querySelector('.modal-back')) {
+          ev.preventDefault()
+          closeAllModals()
+        }
+      }
+    }, true)
+  }
   return { body, close }
 }
 
@@ -397,7 +692,7 @@ self.onCollide(function (other) {
     <h4>AI Builder</h4>
     <p>Prompt likhe Generate chapo — apnar connected LLM (AI Settings) diye full game generate hoy. Canned offline synth ar nei; without key offline assistant commands diye real scene edit (add coins, clear, colors...) cholbe. IDEA chips gulo prompt idea fill kore generate trigger kore.</p>
     <h4>Shortcuts</h4>
-    <p><code>Del</code> delete entity · <code>Ctrl+D</code> duplicate · <code>Ctrl+S</code> save · RMB drag = orbit/pan · Wheel = zoom</p>
+    <p><code>Del</code> delete entity · <code>Ctrl+D</code> duplicate · <code>Ctrl+S</code> save · <code>Ctrl+Z</code>/<code>Ctrl+Shift+Z</code> undo/redo · <code>Ctrl+C/V/X</code> clipboard · <code>Ctrl+A</code> select all · <code>Arrows</code> nudge (Shift = big step) · RMB drag = orbit/pan · Wheel = zoom</p>
   </div>`
 }
 
@@ -409,10 +704,13 @@ export function openShortcutsModal() {
   <div class="doc">
     <h4>Editor</h4>
     <p><code>Del</code> delete entity · <code>Ctrl+D</code> duplicate · <code>Ctrl+S</code> save project<br>
+    <code>Ctrl+Z</code> undo · <code>Ctrl+Shift+Z</code> redo · <code>Ctrl+C</code>/<code>V</code>/<code>X</code> copy/paste/cut · <code>Ctrl+A</code> select all<br>
     <code>F</code> focus selected entity (camera center) · <code>G</code> toggle grid · <code>Esc</code> deselect</p>
     <h4>Viewport</h4>
-    <p>2D: RMB drag = pan · Wheel = zoom · LMB click = select · LMB drag = move<br>
+    <p>2D: RMB drag = pan · Wheel = zoom · LMB click = select · LMB drag = move · Ctrl while dragging = snap to grid · Shift+drag empty area = rubber-band select<br>
     3D: RMB drag = orbit · Wheel = zoom · LMB click = select · LMB drag = move XZ</p>
+    <h4>Multi-select</h4>
+    <p>Hierarchy: <code>Ctrl+click</code> toggle · <code>Shift+click</code> range · <code>Arrows</code> nudge selection (Shift = ×8 step)</p>
     <h4>Play mode</h4>
     <p><code>WASD</code>/<code>Arrows</code> move · <code>Space</code> jump · <code>Mouse</code> camera look (3D first/third) · <code>Esc</code> = <b>Stop</b> back to editor</p>
   </div>`
